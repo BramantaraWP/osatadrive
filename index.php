@@ -6,82 +6,17 @@ ini_set('display_errors', 1);
 // ============================================
 // KONFIGURASI
 // ============================================
-define('DB_FILE', 'osis_cloud.db');
 define('BOT_TOKEN', '8401425763:AAGzfWOOETNcocI7JCj9zQxBhZZ2fVaworI');
 define('CHAT_ID', '-1003838508884');
 define('API_URL', 'https://api.telegram.org/bot');
+define('CHUNK_SIZE', 15 * 1024 * 1024); // 15MB per chunk
 define('MAX_FILE_SIZE', 2 * 1024 * 1024 * 1024); // 2GB
-define('CHUNK_SIZE', 10 * 1024 * 1024); // 10MB chunks untuk upload besar
-define('UPLOAD_TIMEOUT', 300); // 5 menit
+define('DATA_FILE', 'storage.json');
+define('PARTS_FILE', 'file_parts.json');
 
 // Base URL
 $protocol = isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] === 'on' ? "https" : "http";
 $base_url = $protocol . "://" . $_SERVER['HTTP_HOST'] . $_SERVER['SCRIPT_NAME'];
-
-// ============================================
-// INISIALISASI DATABASE
-// ============================================
-try {
-    $db = new PDO("sqlite:" . DB_FILE);
-    $db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-    
-    // Buat tabel jika belum ada
-    $db->exec("
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE NOT NULL,
-            password TEXT NOT NULL,
-            full_name TEXT,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        );
-        
-        CREATE TABLE IF NOT EXISTS files (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            telegram_file_id TEXT UNIQUE NOT NULL,
-            original_name TEXT NOT NULL,
-            display_name TEXT NOT NULL,
-            file_size INTEGER NOT NULL,
-            mime_type TEXT,
-            caption TEXT,
-            uploaded_by INTEGER,
-            upload_date DATETIME DEFAULT CURRENT_TIMESTAMP,
-            is_deleted INTEGER DEFAULT 0,
-            upload_status TEXT DEFAULT 'completed',
-            FOREIGN KEY (uploaded_by) REFERENCES users(id)
-        );
-        
-        CREATE TABLE IF NOT EXISTS upload_chunks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            file_id INTEGER,
-            chunk_index INTEGER,
-            chunk_size INTEGER,
-            status TEXT DEFAULT 'pending',
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (file_id) REFERENCES files(id)
-        );
-    ");
-    
-    // Cek apakah ada user default
-    $stmt = $db->query("SELECT COUNT(*) as count FROM users");
-    $count = $stmt->fetch()['count'];
-    
-    if ($count == 0) {
-        // Tambah user default
-        $users = [
-            ['admin', password_hash('admin123', PASSWORD_DEFAULT), 'Administrator'],
-            ['osis', password_hash('osis2024', PASSWORD_DEFAULT), 'OSIS Member'],
-            ['user', password_hash('user123', PASSWORD_DEFAULT), 'Regular User']
-        ];
-        
-        foreach ($users as $user) {
-            $stmt = $db->prepare("INSERT INTO users (username, password, full_name) VALUES (?, ?, ?)");
-            $stmt->execute($user);
-        }
-    }
-    
-} catch (PDOException $e) {
-    die("Database Error: " . $e->getMessage());
-}
 
 // ============================================
 // FUNGSI UTILITAS
@@ -98,28 +33,20 @@ function formatBytes($bytes, $decimals = 2) {
 function getFileIcon($filename) {
     $ext = strtolower(pathinfo($filename, PATHINFO_EXTENSION));
     $icons = [
-        'jpg' => 'fa-image', 'jpeg' => 'fa-image', 'png' => 'fa-image', 
-        'gif' => 'fa-image', 'webp' => 'fa-image', 'bmp' => 'fa-image', 'svg' => 'fa-image',
+        'jpg' => 'fa-image', 'jpeg' => 'fa-image', 'png' => 'fa-image', 'gif' => 'fa-image',
         'mp4' => 'fa-video', 'avi' => 'fa-video', 'mov' => 'fa-video', 'mkv' => 'fa-video',
         'mp3' => 'fa-music', 'wav' => 'fa-music', 'ogg' => 'fa-music', 'm4a' => 'fa-music',
-        'pdf' => 'fa-file-pdf',
-        'doc' => 'fa-file-word', 'docx' => 'fa-file-word',
-        'xls' => 'fa-file-excel', 'xlsx' => 'fa-file-excel',
-        'zip' => 'fa-file-archive', 'rar' => 'fa-file-archive', '7z' => 'fa-file-archive',
-        'txt' => 'fa-file-alt'
+        'pdf' => 'fa-file-pdf', 'doc' => 'fa-file-word', 'docx' => 'fa-file-word',
+        'zip' => 'fa-file-archive', 'rar' => 'fa-file-archive'
     ];
     return isset($icons[$ext]) ? $icons[$ext] : 'fa-file';
 }
 
 function getFileType($filename) {
     $ext = strtolower(pathinfo($filename, PATHINFO_EXTENSION));
-    $images = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'svg'];
-    $videos = ['mp4', 'avi', 'mov', 'mkv', 'flv', 'wmv', 'webm'];
-    $audios = ['mp3', 'wav', 'ogg', 'm4a', 'flac'];
-    
-    if (in_array($ext, $images)) return 'image';
-    if (in_array($ext, $videos)) return 'video';
-    if (in_array($ext, $audios)) return 'audio';
+    if (in_array($ext, ['jpg', 'jpeg', 'png', 'gif', 'webp'])) return 'image';
+    if (in_array($ext, ['mp4', 'avi', 'mov', 'mkv'])) return 'video';
+    if (in_array($ext, ['mp3', 'wav', 'ogg', 'm4a'])) return 'audio';
     if ($ext == 'pdf') return 'pdf';
     return 'other';
 }
@@ -136,118 +63,85 @@ function getPreviewType($filename) {
 }
 
 // ============================================
-// TELEGRAM API FUNCTIONS dengan STREAMING
+// FUNGSI STORAGE JSON
 // ============================================
-function telegramStreamUpload($file_path, $filename, $caption = '') {
-    if (!file_exists($file_path)) {
-        return ['ok' => false, 'error' => 'File not found'];
+function loadJSON($file) {
+    if (!file_exists($file)) {
+        return [];
     }
-    
-    $fileSize = filesize($file_path);
-    if ($fileSize > MAX_FILE_SIZE) {
-        return ['ok' => false, 'error' => 'File too large (max 2GB)'];
-    }
-    
-    // Untuk file kecil (< 10MB), upload langsung
-    if ($fileSize <= 10 * 1024 * 1024) {
-        return uploadSmallFile($file_path, $filename, $caption);
-    }
-    
-    // Untuk file besar, gunakan chunking
-    return uploadLargeFile($file_path, $filename, $caption);
+    $content = file_get_contents($file);
+    return json_decode($content, true) ?: [];
 }
 
-function uploadSmallFile($file_path, $filename, $caption) {
-    $cfile = new CURLFile($file_path, mime_content_type($file_path), $filename);
-    
-    $params = [
-        'chat_id' => CHAT_ID,
-        'document' => $cfile,
-        'caption' => substr($caption, 0, 1024)
-    ];
-    
-    return telegramRequest('sendDocument', $params);
+function saveJSON($file, $data) {
+    file_put_contents($file, json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE));
 }
 
-function uploadLargeFile($file_path, $filename, $caption) {
-    $fileSize = filesize($file_path);
-    $totalChunks = ceil($fileSize / CHUNK_SIZE);
-    $file_id = null;
-    
-    $handle = fopen($file_path, 'rb');
-    if (!$handle) {
-        return ['ok' => false, 'error' => 'Cannot open file'];
-    }
-    
-    // Upload per chunk dengan timeout rendah
-    for ($i = 0; $i < $totalChunks; $i++) {
-        $offset = $i * CHUNK_SIZE;
-        $chunkSize = ($i == $totalChunks - 1) ? $fileSize - $offset : CHUNK_SIZE;
-        
-        // Baca chunk
-        fseek($handle, $offset);
-        $chunkData = fread($handle, $chunkSize);
-        
-        // Simpan ke temporary file
-        $tempFile = tempnam(sys_get_temp_dir(), 'chunk_');
-        file_put_contents($tempFile, $chunkData);
-        
-        $cfile = new CURLFile($tempFile, 'application/octet-stream', $filename);
-        
-        $params = [
-            'chat_id' => CHAT_ID,
-            'document' => $cfile,
-            'caption' => ($i === 0) ? substr($caption, 0, 1024) : ''
-        ];
-        
-        $result = telegramRequest('sendDocument', $params, 60); // Timeout 60 detik per chunk
-        
-        // Hapus temporary file
-        unlink($tempFile);
-        
-        if (!$result['ok']) {
-            fclose($handle);
-            return $result;
-        }
-        
-        if ($i === 0) {
-            $file_id = $result['result']['document']['file_id'];
-        }
-        
-        // Update progress (simpan di session)
-        $progress = round(($i + 1) / $totalChunks * 100);
-        $_SESSION['upload_progress'] = $progress;
-        session_write_close(); // Lepas lock session
-        session_start(); // Mulai lagi
-        
-        // Beri waktu istirahat antara chunk
-        if ($i < $totalChunks - 1) {
-            sleep(1);
-        }
-    }
-    
-    fclose($handle);
-    
-    if ($file_id) {
-        return [
-            'ok' => true,
-            'file_id' => $file_id,
-            'file_name' => $filename,
-            'file_size' => $fileSize,
-            'mime_type' => mime_content_type($file_path)
-        ];
-    }
-    
-    return ['ok' => false, 'error' => 'Upload failed'];
+function addFileToStorage($file_data) {
+    $storage = loadJSON(DATA_FILE);
+    $storage[] = $file_data;
+    saveJSON(DATA_FILE, $storage);
+    return count($storage) - 1; // Return index
 }
 
-function telegramRequest($method, $params = [], $timeout = 30) {
+function updateFileInStorage($index, $file_data) {
+    $storage = loadJSON(DATA_FILE);
+    if (isset($storage[$index])) {
+        $storage[$index] = $file_data;
+        saveJSON(DATA_FILE, $storage);
+        return true;
+    }
+    return false;
+}
+
+function deleteFileFromStorage($index) {
+    $storage = loadJSON(DATA_FILE);
+    if (isset($storage[$index])) {
+        array_splice($storage, $index, 1);
+        saveJSON(DATA_FILE, $storage);
+        return true;
+    }
+    return false;
+}
+
+function getAllFiles() {
+    return loadJSON(DATA_FILE);
+}
+
+// ============================================
+// FUNGSI FILE PARTS (Untuk chunking)
+// ============================================
+function saveFileParts($filename, $parts) {
+    $parts_data = loadJSON(PARTS_FILE);
+    $parts_data[$filename] = $parts;
+    saveJSON(PARTS_FILE, $parts_data);
+}
+
+function getFileParts($filename) {
+    $parts_data = loadJSON(PARTS_FILE);
+    return $parts_data[$filename] ?? [];
+}
+
+function deleteFileParts($filename) {
+    $parts_data = loadJSON(PARTS_FILE);
+    if (isset($parts_data[$filename])) {
+        unset($parts_data[$filename]);
+        saveJSON(PARTS_FILE, $parts_data);
+        return true;
+    }
+    return false;
+}
+
+// ============================================
+// TELEGRAM API FUNCTIONS (Dengan Auto Caption JSON)
+// ============================================
+function telegramRequest($method, $params = []) {
     $url = API_URL . BOT_TOKEN . '/' . $method;
     
     $ch = curl_init();
     curl_setopt($ch, CURLOPT_URL, $url);
     curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-    curl_setopt($ch, CURLOPT_TIMEOUT, $timeout);
+    curl_setopt($ch, CURLOPT_TIMEOUT, 300);
     curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
     curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
     
@@ -275,11 +169,235 @@ function telegramRequest($method, $params = [], $timeout = 30) {
     curl_close($ch);
     
     if ($error) {
-        return ['ok' => false, 'error' => "CURL Error: $error"];
+        return ['ok' => false, 'error' => $error];
     }
     
     $data = json_decode($response, true);
     return $data;
+}
+
+// Fungsi untuk mendapatkan semua file dari Telegram menggunakan getUpdates
+function getFilesFromTelegram() {
+    $result = telegramRequest('getUpdates', [
+        'offset' => -100,
+        'limit' => 100,
+        'timeout' => 30
+    ]);
+    
+    $files = [];
+    
+    if ($result['ok']) {
+        foreach ($result['result'] as $update) {
+            if (isset($update['channel_post']['document'])) {
+                $post = $update['channel_post'];
+                $doc = $post['document'];
+                
+                // Parse caption JSON jika ada
+                $caption_data = ['filename' => $doc['file_name'] ?? 'Unknown'];
+                if (!empty($post['caption'])) {
+                    $parsed = json_decode($post['caption'], true);
+                    if ($parsed) {
+                        $caption_data = $parsed;
+                    }
+                }
+                
+                $files[] = [
+                    'file_id' => $doc['file_id'],
+                    'filename' => $caption_data['filename'],
+                    'size' => $doc['file_size'] ?? 0,
+                    'mime_type' => $doc['mime_type'] ?? 'application/octet-stream',
+                    'caption' => $post['caption'] ?? '',
+                    'date' => $post['date'],
+                    'part' => $caption_data['part'] ?? null,
+                    'total_parts' => $caption_data['total_parts'] ?? null,
+                    'original_name' => $caption_data['original_name'] ?? $caption_data['filename']
+                ];
+            }
+        }
+    }
+    
+    return $files;
+}
+
+// Upload dengan chunking dan auto caption JSON
+function uploadToTelegramWithChunks($file_path, $filename) {
+    $file_size = filesize($file_path);
+    
+    // Jika file <= CHUNK_SIZE, upload langsung
+    if ($file_size <= CHUNK_SIZE) {
+        $cfile = new CURLFile($file_path, mime_content_type($file_path), $filename);
+        
+        // Auto caption dalam format JSON
+        $caption = json_encode([
+            'filename' => $filename,
+            'original_name' => $filename,
+            'part' => 1,
+            'total_parts' => 1,
+            'upload_time' => time()
+        ], JSON_UNESCAPED_UNICODE);
+        
+        $params = [
+            'chat_id' => CHAT_ID,
+            'document' => $cfile,
+            'caption' => $caption
+        ];
+        
+        $result = telegramRequest('sendDocument', $params);
+        
+        if ($result['ok'] && isset($result['result']['document'])) {
+            return [
+                'success' => true,
+                'parts' => [[
+                    'file_id' => $result['result']['document']['file_id'],
+                    'part' => 1,
+                    'total_parts' => 1
+                ]],
+                'message_id' => $result['result']['message_id']
+            ];
+        }
+        return ['success' => false, 'error' => $result['error'] ?? 'Upload failed'];
+    }
+    
+    // Jika file besar, pecah menjadi chunk
+    $total_parts = ceil($file_size / CHUNK_SIZE);
+    $parts = [];
+    
+    $handle = fopen($file_path, 'rb');
+    if (!$handle) {
+        return ['success' => false, 'error' => 'Cannot open file'];
+    }
+    
+    for ($i = 0; $i < $total_parts; $i++) {
+        $offset = $i * CHUNK_SIZE;
+        $chunk_data = fread($handle, CHUNK_SIZE);
+        
+        // Simpan chunk ke temporary file
+        $temp_file = tempnam(sys_get_temp_dir(), 'chunk_');
+        file_put_contents($temp_file, $chunk_data);
+        
+        $cfile = new CURLFile($temp_file, 'application/octet-stream', "{$filename}.part" . ($i + 1));
+        
+        // Auto caption dengan informasi part
+        $caption = json_encode([
+            'filename' => $filename,
+            'original_name' => $filename,
+            'part' => $i + 1,
+            'total_parts' => $total_parts,
+            'upload_time' => time()
+        ], JSON_UNESCAPED_UNICODE);
+        
+        $params = [
+            'chat_id' => CHAT_ID,
+            'document' => $cfile,
+            'caption' => $caption
+        ];
+        
+        $result = telegramRequest('sendDocument', $params);
+        
+        // Hapus temporary file
+        unlink($temp_file);
+        
+        if (!$result['ok']) {
+            fclose($handle);
+            return ['success' => false, 'error' => "Chunk " . ($i + 1) . " failed: " . ($result['error'] ?? 'Unknown')];
+        }
+        
+        $parts[] = [
+            'file_id' => $result['result']['document']['file_id'],
+            'part' => $i + 1,
+            'total_parts' => $total_parts,
+            'message_id' => $result['result']['message_id']
+        ];
+        
+        // Update progress (bisa digunakan untuk progress bar)
+        $_SESSION['upload_progress'] = round(($i + 1) / $total_parts * 100);
+    }
+    
+    fclose($handle);
+    
+    // Simpan informasi parts
+    saveFileParts($filename, $parts);
+    
+    return [
+        'success' => true,
+        'parts' => $parts,
+        'total_parts' => $total_parts
+    ];
+}
+
+// Gabungkan chunk saat download
+function downloadChunkedFile($filename) {
+    $parts = getFileParts($filename);
+    
+    if (empty($parts)) {
+        // Coba cari dari Telegram
+        $telegram_files = getFilesFromTelegram();
+        $file_parts = [];
+        
+        foreach ($telegram_files as $file) {
+            if (!empty($file['caption'])) {
+                $caption_data = json_decode($file['caption'], true);
+                if ($caption_data && ($caption_data['filename'] == $filename || $caption_data['original_name'] == $filename)) {
+                    $file_parts[] = [
+                        'file_id' => $file['file_id'],
+                        'part' => $caption_data['part'] ?? 1,
+                        'total_parts' => $caption_data['total_parts'] ?? 1
+                    ];
+                }
+            }
+        }
+        
+        // Urutkan berdasarkan part
+        usort($file_parts, function($a, $b) {
+            return $a['part'] - $b['part'];
+        });
+        
+        $parts = $file_parts;
+    }
+    
+    if (empty($parts)) {
+        return false;
+    }
+    
+    // Jika hanya 1 part, langsung download
+    if (count($parts) == 1) {
+        return downloadSingleFile($parts[0]['file_id']);
+    }
+    
+    // Jika multiple parts, gabungkan
+    $combined_content = '';
+    
+    foreach ($parts as $part) {
+        $file_content = downloadSingleFile($part['file_id']);
+        if ($file_content === false) {
+            return false;
+        }
+        $combined_content .= $file_content;
+    }
+    
+    return $combined_content;
+}
+
+function downloadSingleFile($file_id) {
+    $result = telegramRequest('getFile', ['file_id' => $file_id]);
+    
+    if ($result['ok']) {
+        $file_path = $result['result']['file_path'];
+        $telegram_url = "https://api.telegram.org/file/bot" . BOT_TOKEN . "/" . $file_path;
+        
+        $ch = curl_init($telegram_url);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+        curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
+        curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+        
+        $content = curl_exec($ch);
+        curl_close($ch);
+        
+        return $content;
+    }
+    
+    return false;
 }
 
 function getFileUrl($file_id) {
@@ -294,99 +412,21 @@ function getFileUrl($file_id) {
 }
 
 // ============================================
-// DATABASE FUNCTIONS
-// ============================================
-function saveFileToDB($telegram_file_id, $filename, $size, $mime_type, $caption, $uploaded_by) {
-    global $db;
-    
-    try {
-        $stmt = $db->prepare("
-            INSERT OR REPLACE INTO files 
-            (telegram_file_id, original_name, display_name, file_size, mime_type, caption, uploaded_by) 
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        ");
-        
-        $stmt->execute([
-            $telegram_file_id,
-            $filename,
-            $filename,
-            $size,
-            $mime_type,
-            $caption,
-            $uploaded_by
-        ]);
-        
-        return $db->lastInsertId();
-    } catch (PDOException $e) {
-        return false;
-    }
-}
-
-function getAllFiles() {
-    global $db;
-    $stmt = $db->prepare("
-        SELECT f.*, u.username as uploaded_by_name 
-        FROM files f 
-        LEFT JOIN users u ON f.uploaded_by = u.id 
-        WHERE f.is_deleted = 0 AND f.upload_status = 'completed'
-        ORDER BY f.upload_date DESC 
-        LIMIT 100
-    ");
-    $stmt->execute();
-    return $stmt->fetchAll();
-}
-
-function getFileByTelegramId($telegram_file_id) {
-    global $db;
-    $stmt = $db->prepare("
-        SELECT f.*, u.username as uploaded_by_name 
-        FROM files f 
-        LEFT JOIN users u ON f.uploaded_by = u.id 
-        WHERE f.telegram_file_id = ? AND f.is_deleted = 0
-    ");
-    $stmt->execute([$telegram_file_id]);
-    return $stmt->fetch();
-}
-
-function updateFileName($telegram_file_id, $new_name) {
-    global $db;
-    
-    try {
-        $stmt = $db->prepare("UPDATE files SET display_name = ? WHERE telegram_file_id = ?");
-        $stmt->execute([$new_name, $telegram_file_id]);
-        return true;
-    } catch (PDOException $e) {
-        return false;
-    }
-}
-
-function deleteFile($telegram_file_id) {
-    global $db;
-    
-    try {
-        $stmt = $db->prepare("UPDATE files SET is_deleted = 1 WHERE telegram_file_id = ?");
-        return $stmt->execute([$telegram_file_id]);
-    } catch (PDOException $e) {
-        return false;
-    }
-}
-
-// ============================================
 // SISTEM LOGIN
 // ============================================
+$users = [
+    'admin' => password_hash('admin123', PASSWORD_DEFAULT),
+    'osis' => password_hash('osis2024', PASSWORD_DEFAULT),
+    'user' => password_hash('user123', PASSWORD_DEFAULT)
+];
+
 if (isset($_POST['login'])) {
     $username = $_POST['username'] ?? '';
     $password = $_POST['password'] ?? '';
     
-    $stmt = $db->prepare("SELECT * FROM users WHERE username = ?");
-    $stmt->execute([$username]);
-    $user = $stmt->fetch();
-    
-    if ($user && password_verify($password, $user['password'])) {
+    if (isset($users[$username]) && password_verify($password, $users[$username])) {
         $_SESSION['loggedin'] = true;
-        $_SESSION['user_id'] = $user['id'];
-        $_SESSION['username'] = $user['username'];
-        $_SESSION['full_name'] = $user['full_name'];
+        $_SESSION['username'] = $username;
         $_SESSION['login_time'] = time();
         
         header("Location: " . $base_url);
@@ -403,195 +443,199 @@ if (isset($_GET['logout'])) {
 }
 
 // ============================================
-// HANDLE UPLOAD FILE dengan AJAX STREAMING
+// HANDLE UPLOAD FILE (One-click)
 // ============================================
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'start_upload') {
-    if (!isset($_SESSION['loggedin'])) {
-        echo json_encode(['success' => false, 'error' => 'Not logged in']);
-        exit;
-    }
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['fileupload']) && isset($_SESSION['loggedin'])) {
+    $file = $_FILES['fileupload'];
     
-    $filename = $_POST['filename'] ?? '';
-    $filesize = intval($_POST['filesize'] ?? 0);
-    
-    if ($filesize > MAX_FILE_SIZE) {
-        echo json_encode(['success' => false, 'error' => 'File too large (max 2GB)']);
-        exit;
-    }
-    
-    // Generate unique ID untuk upload session
-    $upload_id = uniqid('upload_', true);
-    $_SESSION['upload_queue'][$upload_id] = [
-        'filename' => $filename,
-        'filesize' => $filesize,
-        'chunks' => [],
-        'progress' => 0,
-        'status' => 'pending'
-    ];
-    
-    echo json_encode(['success' => true, 'upload_id' => $upload_id]);
-    exit;
-}
-
-// Endpoint untuk upload chunk
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'upload_chunk') {
-    if (!isset($_SESSION['loggedin'])) {
-        echo json_encode(['success' => false, 'error' => 'Not logged in']);
-        exit;
-    }
-    
-    $upload_id = $_POST['upload_id'] ?? '';
-    $chunk_index = intval($_POST['chunk_index'] ?? 0);
-    $chunk_data = $_POST['chunk_data'] ?? '';
-    
-    if (empty($upload_id) || !isset($_SESSION['upload_queue'][$upload_id])) {
-        echo json_encode(['success' => false, 'error' => 'Invalid upload session']);
-        exit;
-    }
-    
-    // Decode chunk data (base64)
-    $chunk_binary = base64_decode($chunk_data);
-    
-    // Simpan chunk ke temporary file
-    $temp_dir = sys_get_temp_dir() . '/osis_uploads/';
-    if (!file_exists($temp_dir)) {
-        mkdir($temp_dir, 0777, true);
-    }
-    
-    $chunk_file = $temp_dir . $upload_id . '_chunk_' . $chunk_index;
-    file_put_contents($chunk_file, $chunk_binary);
-    
-    // Simpan info chunk
-    $_SESSION['upload_queue'][$upload_id]['chunks'][$chunk_index] = $chunk_file;
-    $_SESSION['upload_queue'][$upload_id]['progress'] = ($chunk_index + 1) / ceil($_SESSION['upload_queue'][$upload_id]['filesize'] / CHUNK_SIZE) * 100;
-    
-    echo json_encode(['success' => true, 'progress' => $_SESSION['upload_queue'][$upload_id]['progress']]);
-    exit;
-}
-
-// Endpoint untuk complete upload
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'complete_upload') {
-    if (!isset($_SESSION['loggedin'])) {
-        echo json_encode(['success' => false, 'error' => 'Not logged in']);
-        exit;
-    }
-    
-    $upload_id = $_POST['upload_id'] ?? '';
-    
-    if (empty($upload_id) || !isset($_SESSION['upload_queue'][$upload_id])) {
-        echo json_encode(['success' => false, 'error' => 'Invalid upload session']);
-        exit;
-    }
-    
-    $upload_info = $_SESSION['upload_queue'][$upload_id];
-    
-    try {
-        // Gabungkan semua chunk menjadi satu file
-        $temp_file = sys_get_temp_dir() . '/osis_uploads/' . $upload_id . '_complete';
-        $fp = fopen($temp_file, 'wb');
-        
-        ksort($upload_info['chunks']);
-        foreach ($upload_info['chunks'] as $chunk_file) {
-            $chunk_data = file_get_contents($chunk_file);
-            fwrite($fp, $chunk_data);
-            unlink($chunk_file); // Hapus chunk file
-        }
-        fclose($fp);
-        
-        // Upload ke Telegram
-        $caption = pathinfo($upload_info['filename'], PATHINFO_FILENAME);
-        $result = telegramStreamUpload($temp_file, $upload_info['filename'], $caption);
-        
-        // Hapus temporary file
-        unlink($temp_file);
-        
-        if ($result['ok']) {
-            // Simpan ke database
-            saveFileToDB(
-                $result['file_id'],
-                $result['file_name'],
-                $result['file_size'],
-                $result['mime_type'],
-                $caption,
-                $_SESSION['user_id']
-            );
-            
-            // Hapus dari upload queue
-            unset($_SESSION['upload_queue'][$upload_id]);
-            
-            echo json_encode([
-                'success' => true, 
-                'message' => 'File uploaded successfully!',
-                'file_id' => $result['file_id']
-            ]);
+    if ($file['error'] === UPLOAD_ERR_OK) {
+        if ($file['size'] > MAX_FILE_SIZE) {
+            $upload_error = "File terlalu besar (maksimal 2GB)";
         } else {
-            echo json_encode(['success' => false, 'error' => 'Telegram upload failed: ' . ($result['error'] ?? 'Unknown error')]);
+            // Upload ke Telegram dengan chunking
+            $result = uploadToTelegramWithChunks($file['tmp_name'], $file['name']);
+            
+            if ($result['success']) {
+                // Simpan ke storage JSON
+                $file_data = [
+                    'filename' => $file['name'],
+                    'size' => $file['size'],
+                    'mime_type' => $file['type'],
+                    'uploaded_by' => $_SESSION['username'],
+                    'upload_time' => time(),
+                    'parts' => $result['parts'] ?? [],
+                    'total_parts' => $result['total_parts'] ?? 1,
+                    'message_id' => $result['message_id'] ?? null
+                ];
+                
+                addFileToStorage($file_data);
+                $upload_success = "File '" . htmlspecialchars($file['name']) . "' berhasil diupload!";
+            } else {
+                $upload_error = "Gagal mengupload file: " . ($result['error'] ?? 'Unknown error');
+            }
         }
-        
-    } catch (Exception $e) {
-        echo json_encode(['success' => false, 'error' => 'Error: ' . $e->getMessage()]);
+    } else {
+        $upload_error = "Error upload: " . $file['error'];
     }
-    exit;
-}
-
-// Endpoint untuk get upload progress
-if ($_SERVER['REQUEST_METHOD'] === 'GET' && isset($_GET['action']) && $_GET['action'] === 'get_progress') {
-    if (!isset($_SESSION['loggedin'])) {
-        echo json_encode(['success' => false, 'error' => 'Not logged in']);
-        exit;
-    }
-    
-    $upload_id = $_GET['upload_id'] ?? '';
-    
-    if (empty($upload_id) || !isset($_SESSION['upload_queue'][$upload_id])) {
-        echo json_encode(['success' => false, 'error' => 'Invalid upload session']);
-        exit;
-    }
-    
-    echo json_encode([
-        'success' => true,
-        'progress' => $_SESSION['upload_queue'][$upload_id]['progress'],
-        'filename' => $_SESSION['upload_queue'][$upload_id]['filename']
-    ]);
-    exit;
 }
 
 // ============================================
 // HANDLE DOWNLOAD FILE
 // ============================================
 if (isset($_GET['download']) && isset($_SESSION['loggedin'])) {
-    $file_id = $_GET['file_id'] ?? '';
+    $filename = $_GET['filename'] ?? '';
     
-    $file = getFileByTelegramId($file_id);
-    if ($file) {
-        $file_url = getFileUrl($file_id);
+    if (!empty($filename)) {
+        $content = downloadChunkedFile($filename);
         
-        if ($file_url) {
+        if ($content !== false) {
             header('Content-Type: application/octet-stream');
-            header('Content-Disposition: attachment; filename="' . basename($file['display_name']) . '"');
+            header('Content-Disposition: attachment; filename="' . basename($filename) . '"');
             header('Content-Transfer-Encoding: binary');
+            header('Content-Length: ' . strlen($content));
             
-            // Stream file dari Telegram
-            $ch = curl_init($file_url);
-            curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-            curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
-            curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
-            
-            $file_content = curl_exec($ch);
-            curl_close($ch);
-            
-            echo $file_content;
+            echo $content;
             exit;
         }
+    }
+    $download_error = "File tidak ditemukan";
+}
+
+// ============================================
+// HANDLE DELETE FILE
+// ============================================
+if (isset($_GET['delete']) && isset($_SESSION['loggedin'])) {
+    $index = $_GET['index'] ?? '';
+    $filename = $_GET['filename'] ?? '';
+    
+    if (!empty($index)) {
+        // Hapus dari storage
+        if (deleteFileFromStorage($index)) {
+            $delete_success = "File berhasil dihapus dari storage";
+        }
+    }
+    
+    if (!empty($filename)) {
+        // Hapus parts information
+        deleteFileParts($filename);
     }
 }
 
 // ============================================
-// LOAD FILES
+// HANDLE SHARE FILE
+// ============================================
+if (isset($_POST['share']) && isset($_SESSION['loggedin'])) {
+    $filename = $_POST['filename'] ?? '';
+    
+    if (!empty($filename)) {
+        // Generate share token
+        $share_token = bin2hex(random_bytes(16));
+        
+        // Simpan di session (atau bisa di JSON terpisah)
+        $_SESSION['share_tokens'][$share_token] = [
+            'filename' => $filename,
+            'created' => time(),
+            'created_by' => $_SESSION['username']
+        ];
+        
+        $share_url = $base_url . "?share=" . $share_token;
+        $share_success = "Link sharing berhasil dibuat!";
+        $share_link = $share_url;
+    }
+}
+
+// ============================================
+// HANDLE SHARED LINK ACCESS
+// ============================================
+if (isset($_GET['share'])) {
+    $token = $_GET['share'] ?? '';
+    
+    if (isset($_SESSION['share_tokens'][$token])) {
+        $file_data = $_SESSION['share_tokens'][$token];
+        $filename = $file_data['filename'];
+        
+        $content = downloadChunkedFile($filename);
+        
+        if ($content !== false) {
+            header('Content-Type: application/octet-stream');
+            header('Content-Disposition: attachment; filename="' . basename($filename) . '"');
+            header('Content-Transfer-Encoding: binary');
+            
+            echo $content;
+            exit;
+        }
+    } else {
+        $share_error = "Link sharing tidak valid atau sudah kadaluarsa";
+    }
+}
+
+// ============================================
+// LOAD FILES (Dari Telegram API + Storage JSON)
 // ============================================
 $all_files = [];
 if (isset($_SESSION['loggedin'])) {
+    // Ambil dari storage JSON
     $all_files = getAllFiles();
+    
+    // Juga ambil dari Telegram API untuk memastikan data lengkap
+    $telegram_files = getFilesFromTelegram();
+    
+    // Gabungkan dan group berdasarkan filename
+    $grouped_files = [];
+    
+    foreach ($telegram_files as $file) {
+        $filename = $file['original_name'] ?? $file['filename'];
+        
+        if (!isset($grouped_files[$filename])) {
+            $grouped_files[$filename] = [
+                'filename' => $filename,
+                'size' => $file['size'],
+                'mime_type' => $file['mime_type'],
+                'date' => $file['date'],
+                'parts' => [],
+                'uploaded_by' => 'Telegram',
+                'total_parts' => $file['total_parts'] ?? 1
+            ];
+        }
+        
+        if ($file['part']) {
+            $grouped_files[$filename]['parts'][] = [
+                'part' => $file['part'],
+                'file_id' => $file['file_id']
+            ];
+        }
+    }
+    
+    // Tambahkan dari storage JSON jika belum ada
+    foreach ($all_files as $file) {
+        if (!isset($grouped_files[$file['filename']])) {
+            $grouped_files[$file['filename']] = $file;
+        }
+    }
+    
+    // Konversi ke array untuk ditampilkan
+    $all_files = array_values($grouped_files);
+    
+    // Urutkan berdasarkan tanggal
+    usort($all_files, function($a, $b) {
+        return ($b['date'] ?? 0) - ($a['date'] ?? 0);
+    });
+}
+
+// Hitung statistik
+$stats = [
+    'total_files' => count($all_files),
+    'total_size' => 0,
+    'by_type' => []
+];
+
+foreach ($all_files as $file) {
+    $stats['total_size'] += $file['size'] ?? 0;
+    $type = getFileType($file['filename']);
+    if (!isset($stats['by_type'][$type])) {
+        $stats['by_type'][$type] = 0;
+    }
+    $stats['by_type'][$type]++;
 }
 ?>
 <!DOCTYPE html>
@@ -636,12 +680,6 @@ if (isset($_SESSION['loggedin'])) {
             width: 100%;
             max-width: 400px;
             padding: 40px;
-            animation: fadeIn 0.5s ease;
-        }
-        
-        @keyframes fadeIn {
-            from { opacity: 0; transform: translateY(20px); }
-            to { opacity: 1; transform: translateY(0); }
         }
         
         .login-logo {
@@ -681,50 +719,41 @@ if (isset($_SESSION['loggedin'])) {
         }
         
         /* Upload Zone */
-        .upload-zone {
-            border: 3px dashed #ddd;
-            border-radius: 10px;
-            padding: 40px;
+        .upload-container {
+            padding: 20px;
             text-align: center;
-            cursor: pointer;
-            transition: all 0.3s;
-            background: #f8f9fa;
-            margin: 20px;
+        }
+        
+        .upload-box {
+            display: inline-block;
             position: relative;
         }
         
-        .upload-zone:hover {
-            border-color: var(--accent);
-            background: #e3f2fd;
-        }
-        
-        .upload-zone.dragover {
-            border-color: var(--success);
-            background: #e8f5e9;
-        }
-        
-        /* Progress Bar */
-        .upload-progress {
+        .upload-input {
+            position: absolute;
             width: 100%;
-            height: 20px;
-            background: #e0e0e0;
-            border-radius: 10px;
-            overflow: hidden;
-            margin: 20px 0;
-            display: none;
+            height: 100%;
+            opacity: 0;
+            cursor: pointer;
         }
         
-        .progress-bar {
-            height: 100%;
-            background: linear-gradient(90deg, #4CAF50, #8BC34A);
-            width: 0%;
-            transition: width 0.3s;
+        .upload-btn {
+            background: linear-gradient(135deg, var(--accent) 0%, var(--primary) 100%);
+            color: white;
+            border: none;
+            padding: 15px 30px;
+            border-radius: 10px;
+            font-size: 1.1rem;
+            cursor: pointer;
             display: flex;
             align-items: center;
-            justify-content: center;
-            color: white;
-            font-weight: bold;
-            font-size: 12px;
+            gap: 10px;
+            transition: all 0.3s;
+        }
+        
+        .upload-btn:hover {
+            transform: translateY(-3px);
+            box-shadow: 0 10px 20px rgba(0,0,0,0.2);
         }
         
         /* File Cards */
@@ -736,7 +765,6 @@ if (isset($_SESSION['loggedin'])) {
         }
         
         .file-card {
-            background: white;
             border: 1px solid #e0e0e0;
             border-radius: 10px;
             padding: 15px;
@@ -748,8 +776,8 @@ if (isset($_SESSION['loggedin'])) {
         
         .file-card:hover {
             border-color: var(--accent);
-            box-shadow: 0 5px 15px rgba(52, 152, 219, 0.2);
-            transform: translateY(-3px);
+            box-shadow: 0 5px 15px rgba(57, 73, 171, 0.2);
+            transform: translateY(-5px);
         }
         
         .file-icon {
@@ -772,7 +800,7 @@ if (isset($_SESSION['loggedin'])) {
         
         .file-actions {
             display: flex;
-            gap: 10px;
+            gap: 8px;
             margin-top: 15px;
             opacity: 0;
             transition: opacity 0.3s;
@@ -785,28 +813,30 @@ if (isset($_SESSION['loggedin'])) {
         .btn-action {
             flex: 1;
             font-size: 0.85rem;
+            padding: 5px 10px;
         }
         
-        /* Alerts */
-        .alert-container {
-            position: fixed;
-            top: 20px;
-            right: 20px;
-            z-index: 9999;
-            max-width: 400px;
+        /* Stats */
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            padding: 20px;
         }
         
-        .alert {
+        .stat-card {
+            background: white;
             border-radius: 10px;
-            border: none;
-            box-shadow: 0 5px 15px rgba(0,0,0,0.1);
-            margin-bottom: 10px;
-            animation: slideIn 0.3s;
+            padding: 20px;
+            text-align: center;
+            box-shadow: 0 3px 10px rgba(0,0,0,0.1);
+            border-left: 5px solid var(--accent);
         }
         
-        @keyframes slideIn {
-            from { transform: translateX(100%); opacity: 0; }
-            to { transform: translateX(0); opacity: 1; }
+        .stat-icon {
+            font-size: 2rem;
+            color: var(--accent);
+            margin-bottom: 10px;
         }
         
         /* Preview Modal */
@@ -824,7 +854,6 @@ if (isset($_SESSION['loggedin'])) {
             max-width: 100%;
             max-height: 70vh;
             border-radius: 10px;
-            box-shadow: 0 5px 15px rgba(0,0,0,0.2);
         }
         
         video, audio {
@@ -840,7 +869,41 @@ if (isset($_SESSION['loggedin'])) {
             border-radius: 10px;
         }
         
-        /* Responsive */
+        /* Alerts */
+        .alert-container {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            z-index: 9999;
+            max-width: 400px;
+        }
+        
+        /* Progress Bar */
+        .progress {
+            height: 10px;
+            border-radius: 5px;
+            margin: 10px 0;
+        }
+        
+        /* Badges */
+        .badge-part {
+            background: #e3f2fd;
+            color: #1976d2;
+            font-size: 0.7rem;
+            padding: 2px 6px;
+            border-radius: 10px;
+            margin-left: 5px;
+        }
+        
+        .badge-chunked {
+            background: #fff3e0;
+            color: #f57c00;
+            font-size: 0.7rem;
+            padding: 2px 6px;
+            border-radius: 10px;
+            margin-left: 5px;
+        }
+        
         @media (max-width: 768px) {
             .file-grid {
                 grid-template-columns: 1fr;
@@ -851,23 +914,10 @@ if (isset($_SESSION['loggedin'])) {
                 align-items: stretch;
             }
             
-            .login-card {
-                padding: 30px 20px;
+            .upload-btn {
+                width: 100%;
+                justify-content: center;
             }
-        }
-        
-        /* Upload Status */
-        .upload-status {
-            position: fixed;
-            bottom: 20px;
-            right: 20px;
-            background: white;
-            padding: 15px;
-            border-radius: 10px;
-            box-shadow: 0 5px 15px rgba(0,0,0,0.2);
-            z-index: 1000;
-            display: none;
-            max-width: 300px;
         }
     </style>
 </head>
@@ -892,7 +942,7 @@ if (isset($_SESSION['loggedin'])) {
                 <form method="POST" action="">
                     <div class="mb-3">
                         <label class="form-label">Username</label>
-                        <input type="text" class="form-control" name="username" required autofocus>
+                        <input type="text" class="form-control" name="username" required>
                     </div>
                     
                     <div class="mb-3">
@@ -909,18 +959,41 @@ if (isset($_SESSION['loggedin'])) {
         
     <?php else: ?>
         <!-- MAIN APPLICATION -->
-        <div class="alert-container" id="alertContainer"></div>
-        
-        <!-- Upload Status -->
-        <div class="upload-status" id="uploadStatus">
-            <div class="d-flex justify-content-between align-items-center mb-2">
-                <strong>Uploading...</strong>
-                <button type="button" class="btn-close" onclick="hideUploadStatus()"></button>
-            </div>
-            <div class="upload-progress">
-                <div class="progress-bar" id="uploadProgressBar">0%</div>
-            </div>
-            <small id="uploadFileName"></small>
+        <div class="alert-container">
+            <?php if (isset($upload_success)): ?>
+                <div class="alert alert-success alert-dismissible fade show">
+                    <i class="fas fa-check-circle me-2"></i>
+                    <?php echo $upload_success; ?>
+                    <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+                </div>
+            <?php endif; ?>
+            
+            <?php if (isset($upload_error)): ?>
+                <div class="alert alert-danger alert-dismissible fade show">
+                    <i class="fas fa-exclamation-circle me-2"></i>
+                    <?php echo htmlspecialchars($upload_error); ?>
+                    <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+                </div>
+            <?php endif; ?>
+            
+            <?php if (isset($share_success)): ?>
+                <div class="alert alert-success alert-dismissible fade show">
+                    <i class="fas fa-check-circle me-2"></i>
+                    <?php echo $share_success; ?>
+                    <?php if (isset($share_link)): ?>
+                        <br><small>Link: <code><?php echo htmlspecialchars($share_link); ?></code></small>
+                    <?php endif; ?>
+                    <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+                </div>
+            <?php endif; ?>
+            
+            <?php if (isset($delete_success)): ?>
+                <div class="alert alert-success alert-dismissible fade show">
+                    <i class="fas fa-check-circle me-2"></i>
+                    <?php echo $delete_success; ?>
+                    <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+                </div>
+            <?php endif; ?>
         </div>
         
         <div class="app-container">
@@ -931,17 +1004,27 @@ if (isset($_SESSION['loggedin'])) {
                         <h1 class="h3 mb-0">
                             <i class="fas fa-cloud me-2"></i>OSIS Cloud Storage
                         </h1>
-                        <small>Welcome, <?php echo htmlspecialchars($_SESSION['full_name'] ?? $_SESSION['username']); ?>!</small>
+                        <small>Welcome, <?php echo htmlspecialchars($_SESSION['username']); ?>!</small>
                     </div>
                     
                     <div class="d-flex gap-2">
+                        <form method="POST" action="" enctype="multipart/form-data" id="uploadForm" class="upload-box">
+                            <input type="file" name="fileupload" id="fileInput" class="upload-input" required>
+                            <button type="button" class="btn btn-light upload-btn" onclick="document.getElementById('fileInput').click()">
+                                <i class="fas fa-plus me-2"></i>Add File
+                            </button>
+                        </form>
+                        
                         <div class="dropdown">
                             <button class="btn btn-light dropdown-toggle" type="button" data-bs-toggle="dropdown">
                                 <i class="fas fa-user me-2"></i><?php echo htmlspecialchars($_SESSION['username']); ?>
                             </button>
                             <ul class="dropdown-menu">
-                                <li><a class="dropdown-item" href="#" onclick="document.getElementById('fileInput').click()">
-                                    <i class="fas fa-plus me-2"></i>Add File
+                                <li><a class="dropdown-item" href="#" onclick="showStats()">
+                                    <i class="fas fa-chart-bar me-2"></i>Statistics
+                                </a></li>
+                                <li><a class="dropdown-item" href="#" onclick="refreshFiles()">
+                                    <i class="fas fa-sync-alt me-2"></i>Refresh Files
                                 </a></li>
                                 <li><hr class="dropdown-divider"></li>
                                 <li><a class="dropdown-item" href="?logout=1">
@@ -953,15 +1036,46 @@ if (isset($_SESSION['loggedin'])) {
                 </div>
             </div>
             
-            <!-- Upload Zone -->
-            <div class="upload-zone" id="uploadZone">
-                <i class="fas fa-cloud-upload-alt fa-3x mb-3 text-primary"></i>
-                <h5>Click to select file or drag and drop</h5>
-                <p class="text-muted">Maximum file size: 2GB (Supports large files)</p>
-                <input type="file" id="fileInput" class="d-none">
+            <!-- Upload Progress -->
+            <div class="upload-container" id="uploadProgressContainer" style="display: none;">
+                <div class="progress">
+                    <div class="progress-bar" id="uploadProgressBar" style="width: 0%"></div>
+                </div>
+                <p id="uploadProgressText" class="text-muted mt-2">Preparing upload...</p>
+            </div>
+            
+            <!-- Statistics -->
+            <div class="stats-grid">
+                <div class="stat-card">
+                    <div class="stat-icon">
+                        <i class="fas fa-file"></i>
+                    </div>
+                    <h3><?php echo $stats['total_files']; ?></h3>
+                    <p class="text-muted mb-0">Total Files</p>
+                </div>
                 
-                <div class="upload-progress" id="progressContainer">
-                    <div class="progress-bar" id="progressBar">0%</div>
+                <div class="stat-card">
+                    <div class="stat-icon">
+                        <i class="fas fa-hdd"></i>
+                    </div>
+                    <h3><?php echo formatBytes($stats['total_size']); ?></h3>
+                    <p class="text-muted mb-0">Total Size</p>
+                </div>
+                
+                <div class="stat-card">
+                    <div class="stat-icon">
+                        <i class="fas fa-cloud-upload-alt"></i>
+                    </div>
+                    <h3><?php echo CHUNK_SIZE / 1024 / 1024; ?>MB</h3>
+                    <p class="text-muted mb-0">Chunk Size</p>
+                </div>
+                
+                <div class="stat-card">
+                    <div class="stat-icon">
+                        <i class="fas fa-database"></i>
+                    </div>
+                    <h3>JSON</h3>
+                    <p class="text-muted mb-0">Storage Type</p>
                 </div>
             </div>
             
@@ -971,22 +1085,27 @@ if (isset($_SESSION['loggedin'])) {
                     <div class="col-12 text-center py-5">
                         <i class="fas fa-cloud-upload-alt fa-4x text-muted mb-3"></i>
                         <h3>No files yet</h3>
-                        <p class="text-muted mb-4">Drag and drop a file to upload!</p>
+                        <p class="text-muted mb-4">Select a file to upload!</p>
+                        <button class="btn btn-primary" onclick="document.getElementById('fileInput').click()">
+                            <i class="fas fa-plus me-2"></i>Add File
+                        </button>
                     </div>
                 <?php else: ?>
-                    <?php foreach ($all_files as $file): ?>
+                    <?php foreach ($all_files as $index => $file): ?>
                         <?php
-                        $fileIcon = getFileIcon($file['display_name']);
-                        $fileType = getFileType($file['display_name']);
-                        $uploadDate = date('d M Y H:i', strtotime($file['upload_date']));
-                        $fileSize = formatBytes($file['file_size']);
-                        $canPreview = canPreview($file['display_name']);
-                        $previewType = getPreviewType($file['display_name']);
+                        $fileIcon = getFileIcon($file['filename']);
+                        $fileType = getFileType($file['filename']);
+                        $uploadDate = isset($file['date']) ? date('d M Y H:i', $file['date']) : 
+                                    (isset($file['upload_time']) ? date('d M Y H:i', $file['upload_time']) : 'Unknown');
+                        $fileSize = formatBytes($file['size'] ?? 0);
+                        $canPreview = canPreview($file['filename']);
+                        $previewType = getPreviewType($file['filename']);
+                        $isChunked = ($file['total_parts'] ?? 1) > 1;
                         ?>
                         
                         <div class="file-card" 
-                             data-file-id="<?php echo $file['telegram_file_id']; ?>"
-                             data-file-name="<?php echo htmlspecialchars($file['display_name']); ?>"
+                             data-index="<?php echo $index; ?>"
+                             data-filename="<?php echo htmlspecialchars($file['filename']); ?>"
                              data-file-type="<?php echo $previewType; ?>"
                              data-can-preview="<?php echo $canPreview ? '1' : '0'; ?>">
                             <div class="d-flex align-items-start mb-3">
@@ -995,7 +1114,12 @@ if (isset($_SESSION['loggedin'])) {
                                 </div>
                                 <div style="flex: 1;">
                                     <div class="file-name">
-                                        <?php echo htmlspecialchars($file['display_name']); ?>
+                                        <?php echo htmlspecialchars($file['filename']); ?>
+                                        <?php if ($isChunked): ?>
+                                            <span class="badge-chunked">
+                                                <i class="fas fa-layer-group me-1"></i><?php echo $file['total_parts']; ?> parts
+                                            </span>
+                                        <?php endif; ?>
                                     </div>
                                     <div class="file-meta">
                                         <i class="fas fa-hdd me-1"></i> <?php echo $fileSize; ?>
@@ -1004,20 +1128,31 @@ if (isset($_SESSION['loggedin'])) {
                                         <i class="fas fa-calendar me-1"></i> <?php echo $uploadDate; ?>
                                     </div>
                                     <div class="file-meta">
-                                        <i class="fas fa-user me-1"></i> <?php echo htmlspecialchars($file['uploaded_by_name'] ?? 'Unknown'); ?>
+                                        <i class="fas fa-user me-1"></i> <?php echo htmlspecialchars($file['uploaded_by'] ?? 'Unknown'); ?>
                                     </div>
+                                    <?php if (isset($file['parts']) && count($file['parts']) > 0): ?>
+                                        <div class="file-meta">
+                                            <i class="fas fa-puzzle-piece me-1"></i>
+                                            Parts: <?php echo count($file['parts']); ?>/<?php echo $file['total_parts']; ?>
+                                        </div>
+                                    <?php endif; ?>
                                 </div>
                             </div>
                             
                             <div class="file-actions">
-                                <a href="?download=1&file_id=<?php echo urlencode($file['telegram_file_id']); ?>" 
+                                <a href="?download=1&filename=<?php echo urlencode($file['filename']); ?>" 
                                    class="btn btn-outline-primary btn-action">
-                                    <i class="fas fa-download me-1"></i>
+                                    <i class="fas fa-download"></i>
                                 </a>
                                 
+                                <button class="btn btn-outline-info btn-action" 
+                                        onclick="shareFile('<?php echo urlencode($file['filename']); ?>')">
+                                    <i class="fas fa-share-alt"></i>
+                                </button>
+                                
                                 <button class="btn btn-outline-danger btn-action" 
-                                        onclick="deleteFile('<?php echo $file['telegram_file_id']; ?>', '<?php echo addslashes($file['display_name']); ?>')">
-                                    <i class="fas fa-trash me-1"></i>
+                                        onclick="deleteFile(<?php echo $index; ?>, '<?php echo addslashes($file['filename']); ?>')">
+                                    <i class="fas fa-trash"></i>
                                 </button>
                             </div>
                         </div>
@@ -1035,7 +1170,9 @@ if (isset($_SESSION['loggedin'])) {
                         <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
                     </div>
                     <div class="modal-body">
-                        <div class="preview-content" id="previewContent"></div>
+                        <div class="preview-content" id="previewContent">
+                            <!-- Preview akan di-load di sini -->
+                        </div>
                     </div>
                     <div class="modal-footer">
                         <a href="#" class="btn btn-primary" id="previewDownloadBtn">
@@ -1047,264 +1184,171 @@ if (isset($_SESSION['loggedin'])) {
             </div>
         </div>
         
+        <!-- Statistics Modal -->
+        <div class="modal fade" id="statsModal" tabindex="-1">
+            <div class="modal-dialog modal-lg">
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <h5 class="modal-title">
+                            <i class="fas fa-chart-bar me-2"></i>Statistics
+                        </h5>
+                        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                    </div>
+                    <div class="modal-body">
+                        <div class="row">
+                            <div class="col-md-6">
+                                <div class="card mb-3">
+                                    <div class="card-body">
+                                        <h6>Storage Info</h6>
+                                        <p class="mb-1">Total Files: <strong><?php echo $stats['total_files']; ?></strong></p>
+                                        <p class="mb-1">Total Size: <strong><?php echo formatBytes($stats['total_size']); ?></strong></p>
+                                        <p class="mb-0">Chunk Size: <strong><?php echo formatBytes(CHUNK_SIZE); ?></strong></p>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="col-md-6">
+                                <div class="card mb-3">
+                                    <div class="card-body">
+                                        <h6>User Info</h6>
+                                        <p class="mb-1">Username: <strong><?php echo htmlspecialchars($_SESSION['username']); ?></strong></p>
+                                        <p class="mb-1">Login Time: <strong><?php echo date('H:i:s', $_SESSION['login_time'] ?? time()); ?></strong></p>
+                                        <p class="mb-0">Session: <strong><?php echo session_id(); ?></strong></p>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                        
+                        <h6>Files by Type</h6>
+                        <div class="table-responsive">
+                            <table class="table table-bordered">
+                                <thead>
+                                    <tr>
+                                        <th>File Type</th>
+                                        <th>Count</th>
+                                        <th>Percentage</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    <?php foreach ($stats['by_type'] as $type => $count): ?>
+                                    <tr>
+                                        <td><?php echo ucfirst($type); ?></td>
+                                        <td><?php echo $count; ?></td>
+                                        <td>
+                                            <?php 
+                                                $percentage = $stats['total_files'] > 0 ? ($count / $stats['total_files']) * 100 : 0;
+                                                echo number_format($percentage, 1) . '%';
+                                            ?>
+                                        </td>
+                                    </tr>
+                                    <?php endforeach; ?>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                    <div class="modal-footer">
+                        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Share Modal -->
+        <div class="modal fade" id="shareModal" tabindex="-1">
+            <div class="modal-dialog">
+                <div class="modal-content">
+                    <form method="POST" action="">
+                        <div class="modal-header">
+                            <h5 class="modal-title">
+                                <i class="fas fa-share-alt me-2"></i>Share File
+                            </h5>
+                            <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                        </div>
+                        <div class="modal-body">
+                            <input type="hidden" name="filename" id="shareFileName">
+                            <p>Generate a share link for this file. The link will be valid for this session.</p>
+                        </div>
+                        <div class="modal-footer">
+                            <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                            <button type="submit" name="share" class="btn btn-primary">
+                                <i class="fas fa-link me-2"></i>Generate Link
+                            </button>
+                        </div>
+                    </form>
+                </div>
+            </div>
+        </div>
+        
         <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+        <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
         <script>
-            // Upload Manager dengan Chunking untuk file besar
-            class UploadManager {
-                constructor() {
-                    this.chunkSize = 10 * 1024 * 1024; // 10MB
-                    this.currentUploadId = null;
-                    this.file = null;
-                    this.chunks = [];
-                    this.totalChunks = 0;
-                    this.uploadedChunks = 0;
-                    this.uploadStatus = document.getElementById('uploadStatus');
-                    this.uploadProgressBar = document.getElementById('uploadProgressBar');
-                    this.uploadFileName = document.getElementById('uploadFileName');
-                    this.progressContainer = document.getElementById('progressContainer');
-                    this.progressBar = document.getElementById('progressBar');
-                }
-                
-                async startUpload(file) {
-                    try {
-                        this.file = file;
-                        this.totalChunks = Math.ceil(file.size / this.chunkSize);
-                        
-                        // Start upload session
-                        const response = await fetch('', {
-                            method: 'POST',
-                            headers: {
-                                'Content-Type': 'application/x-www-form-urlencoded',
-                            },
-                            body: new URLSearchParams({
-                                action: 'start_upload',
-                                filename: file.name,
-                                filesize: file.size
-                            })
-                        });
-                        
-                        const data = await response.json();
-                        if (!data.success) {
-                            throw new Error(data.error);
-                        }
-                        
-                        this.currentUploadId = data.upload_id;
-                        
-                        // Show upload status
-                        this.showUploadStatus(file.name);
-                        
-                        // Upload chunks
-                        await this.uploadChunks();
-                        
-                        // Complete upload
-                        await this.completeUpload();
-                        
-                        this.showAlert('File uploaded successfully!', 'success');
-                        setTimeout(() => location.reload(), 2000);
-                        
-                    } catch (error) {
-                        console.error('Upload error:', error);
-                        this.showAlert('Upload failed: ' + error.message, 'error');
-                    } finally {
-                        this.hideUploadStatus();
-                    }
-                }
-                
-                async uploadChunks() {
-                    for (let i = 0; i < this.totalChunks; i++) {
-                        const start = i * this.chunkSize;
-                        const end = Math.min(start + this.chunkSize, this.file.size);
-                        const chunk = this.file.slice(start, end);
-                        
-                        // Read chunk as base64
-                        const chunkBase64 = await this.readChunkAsBase64(chunk);
-                        
-                        // Upload chunk
-                        const formData = new URLSearchParams({
-                            action: 'upload_chunk',
-                            upload_id: this.currentUploadId,
-                            chunk_index: i,
-                            chunk_data: chunkBase64
-                        });
-                        
-                        const response = await fetch('', {
-                            method: 'POST',
-                            headers: {
-                                'Content-Type': 'application/x-www-form-urlencoded',
-                            },
-                            body: formData
-                        });
-                        
-                        const data = await response.json();
-                        if (!data.success) {
-                            throw new Error('Chunk upload failed');
-                        }
-                        
-                        this.uploadedChunks++;
-                        const progress = Math.round((this.uploadedChunks / this.totalChunks) * 100);
-                        this.updateProgress(progress);
-                        
-                        // Check progress from server
-                        await this.checkProgress();
-                    }
-                }
-                
-                async completeUpload() {
-                    const response = await fetch('', {
-                        method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/x-www-form-urlencoded',
-                        },
-                        body: new URLSearchParams({
-                            action: 'complete_upload',
-                            upload_id: this.currentUploadId
-                        })
-                    });
-                    
-                    const data = await response.json();
-                    if (!data.success) {
-                        throw new Error(data.error || 'Upload completion failed');
-                    }
-                    
-                    return data;
-                }
-                
-                async checkProgress() {
-                    const response = await fetch(`?action=get_progress&upload_id=${this.currentUploadId}`);
-                    const data = await response.json();
-                    if (data.success) {
-                        this.updateProgress(data.progress);
-                    }
-                }
-                
-                readChunkAsBase64(chunk) {
-                    return new Promise((resolve, reject) => {
-                        const reader = new FileReader();
-                        reader.onload = () => {
-                            const base64 = reader.result.split(',')[1];
-                            resolve(base64);
-                        };
-                        reader.onerror = reject;
-                        reader.readAsDataURL(chunk);
-                    });
-                }
-                
-                updateProgress(percentage) {
-                    this.progressBar.style.width = percentage + '%';
-                    this.progressBar.textContent = percentage + '%';
-                    
-                    this.uploadProgressBar.style.width = percentage + '%';
-                    this.uploadProgressBar.textContent = percentage + '%';
-                }
-                
-                showUploadStatus(filename) {
-                    this.uploadFileName.textContent = filename;
-                    this.progressContainer.style.display = 'block';
-                    this.uploadStatus.style.display = 'block';
-                }
-                
-                hideUploadStatus() {
-                    this.uploadStatus.style.display = 'none';
-                    this.progressContainer.style.display = 'none';
-                    this.progressBar.style.width = '0%';
-                    this.progressBar.textContent = '0%';
-                }
-                
-                showAlert(message, type = 'info') {
-                    const alertContainer = document.getElementById('alertContainer');
-                    const alert = document.createElement('div');
-                    alert.className = `alert alert-${type === 'error' ? 'danger' : type} alert-dismissible fade show`;
-                    alert.innerHTML = `
-                        <i class="fas fa-${type === 'success' ? 'check-circle' : 'exclamation-circle'} me-2"></i>
-                        ${message}
-                        <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
-                    `;
-                    alertContainer.appendChild(alert);
-                    
-                    setTimeout(() => {
-                        alert.remove();
-                    }, 5000);
-                }
-            }
+            // Inisialisasi modal
+            const previewModal = new bootstrap.Modal(document.getElementById('previewModal'));
+            const statsModal = new bootstrap.Modal(document.getElementById('statsModal'));
+            const shareModal = new bootstrap.Modal(document.getElementById('shareModal'));
             
-            // Initialize upload manager
-            const uploadManager = new UploadManager();
-            
-            // File input handling
-            document.getElementById('fileInput').addEventListener('change', async (e) => {
-                const file = e.target.files[0];
-                if (!file) return;
-                
-                if (file.size > <?php echo MAX_FILE_SIZE; ?>) {
-                    alert('File too large (max 2GB)');
-                    return;
-                }
-                
-                await uploadManager.startUpload(file);
-                e.target.value = '';
-            });
-            
-            // Drag and drop
-            const uploadZone = document.getElementById('uploadZone');
-            
-            uploadZone.addEventListener('dragover', (e) => {
-                e.preventDefault();
-                e.stopPropagation();
-                uploadZone.classList.add('dragover');
-            });
-            
-            uploadZone.addEventListener('dragleave', (e) => {
-                e.preventDefault();
-                e.stopPropagation();
-                uploadZone.classList.remove('dragover');
-            });
-            
-            uploadZone.addEventListener('drop', async (e) => {
-                e.preventDefault();
-                e.stopPropagation();
-                uploadZone.classList.remove('dragover');
-                
-                const files = e.dataTransfer.files;
-                if (files.length > 0) {
-                    const file = files[0];
-                    
-                    if (file.size > <?php echo MAX_FILE_SIZE; ?>) {
+            // One-click upload
+            document.getElementById('fileInput').addEventListener('change', function(e) {
+                const file = this.files[0];
+                if (file) {
+                    const maxSize = <?php echo MAX_FILE_SIZE; ?>;
+                    if (file.size > maxSize) {
                         alert('File too large (max 2GB)');
+                        this.value = '';
                         return;
                     }
                     
-                    await uploadManager.startUpload(file);
+                    // Tampilkan progress bar
+                    document.getElementById('uploadProgressContainer').style.display = 'block';
+                    const progressBar = document.getElementById('uploadProgressBar');
+                    const progressText = document.getElementById('uploadProgressText');
+                    
+                    // Simulasikan progress untuk chunking
+                    let progress = 0;
+                    const chunkSize = <?php echo CHUNK_SIZE; ?>;
+                    const totalChunks = Math.ceil(file.size / chunkSize);
+                    
+                    if (totalChunks > 1) {
+                        progressText.textContent = `Splitting into ${totalChunks} chunks...`;
+                    } else {
+                        progressText.textContent = 'Uploading file...';
+                    }
+                    
+                    const interval = setInterval(() => {
+                        progress += 5;
+                        progressBar.style.width = progress + '%';
+                        
+                        if (progress >= 95) {
+                            clearInterval(interval);
+                            progressText.textContent = 'Finalizing upload...';
+                        }
+                    }, 300);
+                    
+                    // Submit form
+                    document.getElementById('uploadForm').submit();
                 }
             });
             
-            // Click to select file
-            uploadZone.addEventListener('click', () => {
-                document.getElementById('fileInput').click();
-            });
-            
-            // Double click untuk preview file
+            // Double click untuk preview
             document.querySelectorAll('.file-card').forEach(card => {
                 card.addEventListener('dblclick', function() {
                     const canPreview = this.dataset.canPreview === '1';
-                    const fileId = this.dataset.fileId;
-                    const fileName = this.dataset.fileName;
+                    const filename = this.dataset.filename;
                     const fileType = this.dataset.fileType;
                     
                     if (canPreview) {
-                        showPreview(fileId, fileName, fileType);
+                        showPreview(filename, fileType);
                     } else {
-                        window.location.href = `?download=1&file_id=${encodeURIComponent(fileId)}`;
+                        // Download jika tidak bisa preview
+                        window.location.href = `?download=1&filename=${encodeURIComponent(filename)}`;
                     }
                 });
             });
             
-            // Preview Modal
-            const previewModal = new bootstrap.Modal(document.getElementById('previewModal'));
-            
-            function showPreview(fileId, fileName, fileType) {
-                const previewUrl = `?download=1&file_id=${encodeURIComponent(fileId)}`;
+            // Preview function
+            function showPreview(filename, fileType) {
+                const previewUrl = `?download=1&filename=${encodeURIComponent(filename)}`;
                 
-                document.getElementById('previewTitle').textContent = fileName;
+                document.getElementById('previewTitle').textContent = filename;
                 document.getElementById('previewDownloadBtn').href = previewUrl;
                 
                 const previewContent = document.getElementById('previewContent');
@@ -1313,7 +1357,7 @@ if (isset($_SESSION['loggedin'])) {
                 switch(fileType) {
                     case 'image':
                         previewContent.innerHTML = `
-                            <img src="${previewUrl}" class="preview-image" alt="${fileName}" onerror="this.onerror=null;this.src='https://via.placeholder.com/400x300?text=Preview+Not+Available'">
+                            <img src="${previewUrl}" class="preview-image" alt="${filename}">
                         `;
                         break;
                         
@@ -1332,56 +1376,104 @@ if (isset($_SESSION['loggedin'])) {
                                 <source src="${previewUrl}" type="audio/mpeg">
                                 Your browser does not support the audio tag.
                             </audio>
-                            <p class="mt-2">${fileName}</p>
+                            <p class="mt-2">${filename}</p>
                         `;
                         break;
                         
                     case 'pdf':
                         previewContent.innerHTML = `
-                            <div class="text-center">
-                                <i class="fas fa-file-pdf fa-4x text-danger mb-3"></i>
-                                <p>PDF Preview not available in browser</p>
-                                <a href="${previewUrl}" class="btn btn-primary">
-                                    <i class="fas fa-download me-2"></i>Download PDF
-                                </a>
-                            </div>
+                            <div class="pdf-viewer" id="pdfViewer"></div>
+                            <p>PDF Preview (First Page)</p>
                         `;
+                        
+                        // Load PDF preview
+                        setTimeout(() => {
+                            pdfjsLib.getDocument(previewUrl).promise.then(pdf => {
+                                pdf.getPage(1).then(page => {
+                                    const canvas = document.createElement('canvas');
+                                    const context = canvas.getContext('2d');
+                                    const viewport = page.getViewport({ scale: 1.5 });
+                                    
+                                    canvas.height = viewport.height;
+                                    canvas.width = viewport.width;
+                                    
+                                    const renderContext = {
+                                        canvasContext: context,
+                                        viewport: viewport
+                                    };
+                                    
+                                    page.render(renderContext);
+                                    document.getElementById('pdfViewer').appendChild(canvas);
+                                });
+                            });
+                        }, 100);
                         break;
                 }
                 
                 previewModal.show();
             }
             
-            function deleteFile(fileId, fileName) {
-                if (confirm(`Are you sure you want to delete "${fileName}"?`)) {
-                    window.location.href = `?delete=1&file_id=${encodeURIComponent(fileId)}`;
+            function showStats() {
+                statsModal.show();
+            }
+            
+            function refreshFiles() {
+                window.location.reload();
+            }
+            
+            function shareFile(filename) {
+                document.getElementById('shareFileName').value = filename;
+                shareModal.show();
+            }
+            
+            function deleteFile(index, filename) {
+                if (confirm(`Are you sure you want to delete "${filename}"?`)) {
+                    window.location.href = `?delete=1&index=${index}&filename=${encodeURIComponent(filename)}`;
                 }
             }
             
-            function hideUploadStatus() {
-                document.getElementById('uploadStatus').style.display = 'none';
-            }
+            // Auto-hide alerts
+            setTimeout(() => {
+                document.querySelectorAll('.alert').forEach(alert => {
+                    bootstrap.Alert.getInstance(alert)?.close();
+                });
+            }, 5000);
             
-            // Keyboard shortcuts
-            document.addEventListener('keydown', (e) => {
-                if (e.ctrlKey && e.key === 'u') {
-                    e.preventDefault();
-                    document.getElementById('fileInput').click();
-                }
+            // Drag and drop upload
+            document.addEventListener('dragover', function(e) {
+                e.preventDefault();
+                e.stopPropagation();
+            });
+            
+            document.addEventListener('drop', function(e) {
+                e.preventDefault();
+                e.stopPropagation();
                 
-                if (e.key === 'Escape') {
-                    hideUploadStatus();
+                const files = e.dataTransfer.files;
+                if (files.length > 0) {
+                    const fileInput = document.getElementById('fileInput');
+                    const dataTransfer = new DataTransfer();
+                    dataTransfer.items.add(files[0]);
+                    fileInput.files = dataTransfer.files;
+                    fileInput.dispatchEvent(new Event('change'));
                 }
             });
             
-            // Auto-hide alerts
-            setInterval(() => {
-                document.querySelectorAll('.alert').forEach(alert => {
-                    if (alert.parentElement) {
-                        bootstrap.Alert.getInstance(alert)?.close();
+            // Keyboard shortcuts
+            document.addEventListener('keydown', function(e) {
+                if (e.key === 'Escape') {
+                    const modals = document.querySelectorAll('.modal.show');
+                    if (modals.length > 0) {
+                        bootstrap.Modal.getInstance(modals[0])?.hide();
                     }
-                });
-            }, 5000);
+                }
+                
+                // Ctrl+F untuk focus search
+                if (e.ctrlKey && e.key === 'f') {
+                    e.preventDefault();
+                    // Bisa tambahkan search functionality
+                }
+            });
         </script>
     <?php endif; ?>
 </body>
